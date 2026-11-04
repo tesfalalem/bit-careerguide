@@ -1,0 +1,42 @@
+﻿# Environment files and secrets
+.env
+.env.*
+**/.env
+**/.env.*
+!.env.example
+!.env.sample
+!**/.env.example
+!**/.env.sample
+
+# Dependencies
+node_modules/
+vendor/
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+
+# Build files
+dist/
+build/
+coverage/
+
+# IDE and operating system
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs and temporary files
+*.log
+tmp/
+temp/
+
+# Uploaded user files - do not commit
+backend/uploads/**
+!backend/uploads/**/
+!backend/uploads/.htaccess
+!backend/uploads/**/.htaccess
+
+# Local development and database migration tools
+backend/public/run-all-migrations.php
+mobile/devtools_options.yaml

@@ -1,0 +1,231 @@
+<?php
+
+require_once __DIR__ . '/../Models/Course.php';
+require_once __DIR__ . '/../Helpers/JWTHelper.php';
+require_once __DIR__ . '/../Services/AiService.php';
+
+class CourseController {
+    private $courseModel;
+    private $jwtHelper;
+    private $aiService;
+
+    public function __construct() {
+        $this->courseModel = new Course();
+        $this->jwtHelper = new JWTHelper();
+        $this->aiService = new AiService();
+        $this->ensureEnrollmentColumns();
+    }
+
+    private function ensureEnrollmentColumns() {
+        try {
+            $db = new Database();
+            $conn = $db->getConnection();
+            
+            // Check if progress column exists
+            $stmt = $conn->query("SHOW COLUMNS FROM course_enrollments LIKE 'progress'");
+            if ($stmt->rowCount() == 0) {
+                $conn->exec("ALTER TABLE course_enrollments ADD COLUMN progress INT DEFAULT 0");
+            }
+            
+            // Check if completed_lessons column exists
+            $stmt = $conn->query("SHOW COLUMNS FROM course_enrollments LIKE 'completed_lessons'");
+            if ($stmt->rowCount() == 0) {
+                $conn->exec("ALTER TABLE course_enrollments ADD COLUMN completed_lessons JSON DEFAULT NULL");
+            }
+        } catch (\Exception $e) {
+            // Table may not exist yet — safe to ignore, will be created by migration
+        }
+    }
+
+    public function index() {
+        // Get current user (optional — used for AI course isolation)
+        $user = $this->jwtHelper->getUserFromToken();
+        $userId = $user ? $user['id'] : null;
+
+        $courses = $this->courseModel->getAll($userId);
+        foreach ($courses as &$course) {
+            if (isset($course['modules']) && is_string($course['modules'])) {
+                $course['modules'] = json_decode($course['modules'], true);
+            }
+        }
+        echo json_encode($courses);
+    }
+
+    public function show($id) {
+        $user = $this->jwtHelper->getUserFromToken();
+        $course = $this->courseModel->findById($id, $user ? $user['id'] : null);
+        
+        if (!$course) {
+            http_response_code(404);
+            echo json_encode(['error' => 'Course not found']);
+            return;
+        }
+
+        echo json_encode($course);
+    }
+
+    public function generate() {
+        $user = $this->jwtHelper->getUserFromToken();
+        if (!$user) {
+            http_response_code(401);
+            echo json_encode(['error' => 'Unauthorized']);
+            return;
+        }
+
+        $data = json_decode(file_get_contents("php://input"), true);
+        $role = $data['role'] ?? '';
+
+        if (empty($role)) {
+            http_response_code(400);
+            echo json_encode(['error' => 'Role is required']);
+            return;
+        }
+
+        // Generate course structure using Gemini AI
+        $courseData = $this->aiService->generateCourse($role);
+
+        if (!$courseData || !isset($courseData['modules'])) {
+            http_response_code(500);
+            echo json_encode(['error' => 'Failed to generate course. The AI service may be temporarily unavailable. Please try again.']);
+            return;
+        }
+
+        // Save to database with course structure (lessons will be generated on-demand)
+        $courseId = $this->courseModel->create([
+            'title'       => $courseData['title'],
+            'description' => $courseData['description'],
+            'category'    => $role,
+            'level'       => $courseData['level'],
+            'modules'     => json_encode($courseData['modules']),
+            'duration'    => $courseData['duration'],
+            'author'      => 'AI Architect',
+            'created_by'  => $user['id']
+        ]);
+
+        if ($courseId) {
+            // Auto-enroll creator
+            $this->courseModel->enroll($courseId, $user['id']);
+
+            $course = $this->courseModel->findById($courseId);
+
+            // Parse modules JSON string back to array for frontend
+            if (isset($course['modules']) && is_string($course['modules'])) {
+                $course['modules'] = json_decode($course['modules'], true);
+            }
+
+            echo json_encode($course);
+        } else {
+            http_response_code(500);
+            echo json_encode(['error' => 'Failed to save course']);
+        }
+    }
+
+    public function enroll($courseId) {
+        $user = $this->jwtHelper->getUserFromToken();
+        if (!$user) {
+            http_response_code(401);
+            echo json_encode(['error' => 'Unauthorized']);
+            return;
+        }
+
+        try {
+            // Check if already enrolled
+            $db = new Database();
+            $conn = $db->getConnection();
+            $check = $conn->prepare("SELECT id FROM course_enrollments WHERE course_id = :cid AND user_id = :uid LIMIT 1");
+            $check->bindParam(':cid', $courseId);
+            $check->bindParam(':uid', $user['id']);
+            $check->execute();
+
+            if ($check->rowCount() > 0) {
+                http_response_code(409);
+                echo json_encode(['message' => 'Already enrolled']);
+                return;
+            }
+
+            $result = $this->courseModel->enroll($courseId, $user['id']);
+
+            if ($result) {
+                echo json_encode(['message' => 'Enrolled successfully']);
+            } else {
+                http_response_code(500);
+                echo json_encode(['error' => 'Failed to enroll']);
+            }
+        } catch (\Exception $e) {
+            http_response_code(500);
+            echo json_encode(['error' => 'Enrollment error: ' . $e->getMessage()]);
+        }
+    }
+
+    public function unenroll($courseId) {
+        $user = $this->jwtHelper->getUserFromToken();
+        if (!$user) {
+            http_response_code(401);
+            echo json_encode(['error' => 'Unauthorized']);
+            return;
+        }
+
+        $result = $this->courseModel->unenroll($courseId, $user['id']);
+
+        if ($result) {
+            echo json_encode(['message' => 'Unenrolled successfully']);
+        } else {
+            http_response_code(500);
+            echo json_encode(['error' => 'Failed to unenroll']);
+        }
+    }
+
+    public function userCourses() {
+        $user = $this->jwtHelper->getUserFromToken();
+        if (!$user) {
+            http_response_code(401);
+            echo json_encode(['error' => 'Unauthorized']);
+            return;
+        }
+
+        $courses = $this->courseModel->getUserCourses($user['id']);
+
+        // Parse modules JSON string for each course
+        foreach ($courses as &$course) {
+            if (isset($course['modules']) && is_string($course['modules'])) {
+                $course['modules'] = json_decode($course['modules'], true);
+            }
+        }
+
+        echo json_encode($courses);
+    }
+
+    public function updateProgress($courseId) {
+        $user = $this->jwtHelper->getUserFromToken();
+        if (!$user) {
+            http_response_code(401);
+            echo json_encode(['error' => 'Unauthorized']);
+            return;
+        }
+
+        $data = json_decode(file_get_contents("php://input"), true);
+        $progress = $data['progress'] ?? 0;
+        $completedLessons = $data['completed_lessons'] ?? [];
+
+        $result = $this->courseModel->updateProgress(
+            $courseId,
+            $user['id'],
+            $progress,
+            json_encode($completedLessons)
+        );
+
+        if ($result) {
+            // Update user XP
+            $xpGained = count($completedLessons) * 10;
+            $this->courseModel->updateUserXP($user['id'], $xpGained);
+
+            echo json_encode([
+                'message' => 'Progress updated',
+                'xp_gained' => $xpGained
+            ]);
+        } else {
+            http_response_code(500);
+            echo json_encode(['error' => 'Failed to update progress']);
+        }
+    }
+}

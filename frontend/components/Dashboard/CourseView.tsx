@@ -1,0 +1,955 @@
+import React, { useState, useEffect, useCallback } from 'react';
+import { Course } from '../../types';
+import {
+  PlayCircle, Lock, BookOpen, Clock,
+  ArrowLeft, ArrowRight, Star, ChevronsLeft, Menu,
+  ChevronDown, ChevronRight,
+  Link2, FileText, Image as ImageIcon, Video, Download, ExternalLink,
+  Brain, HelpCircle, Loader2, X, CheckCircle, User, GraduationCap
+} from 'lucide-react';
+import ReactMarkdown from 'react-markdown';
+import { enrollInCourse } from '../../services/courseService';
+import StudentMaterialsTab from './StudentMaterialsTab';
+import TeacherMaterialsTab from './Teacher/TeacherMaterialsTab';
+
+const API_BASE = 'http://localhost/careerguide/backend/api';
+
+interface CourseViewProps {
+  initialCourseData?: Course;
+  onBack: () => void;
+  isEnrolled?: boolean;
+  userId?: string;
+}
+
+// ── Block Renderer ────────────────────────────────────────────────────────────
+const SERVE_BASE = 'http://localhost/careerguide/backend';
+
+// Resolve any URL — handles real URLs and legacy [UPLOADED:filename] format
+const resolveUrl = (raw: string | undefined): string | null => {
+  if (!raw) return null;
+  if (raw.startsWith('[UPLOADED:')) {
+    const filename = raw.replace('[UPLOADED:', '').replace(']', '');
+    return `${SERVE_BASE}/api/uploads/serve?file=${encodeURIComponent(filename)}`;
+  }
+  if (raw.startsWith('[UPLOAD_FAILED') || raw.startsWith('[')) return null;
+  return raw;
+};
+const getYouTubeId = (url: string) => {
+  const m = url?.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/)([^&\s]+)/);
+  return m ? m[1] : null;
+};
+
+const BlockRenderer: React.FC<{ content: string }> = ({ content }) => {
+  if (!content) return null;
+
+  // Helper: detect if a string contains HTML tags
+  const isHtml = (s: string) => /<[a-z][\s\S]*>/i.test(s);
+
+  // Try to parse as JSON block array
+  let blocks: any[] = [];
+  try {
+    const parsed = JSON.parse(content);
+    if (Array.isArray(parsed)) {
+      blocks = parsed;
+    } else if (typeof parsed === 'object' && parsed !== null) {
+      const text = parsed.text || parsed.content || content;
+      if (isHtml(text)) return <div dangerouslySetInnerHTML={{ __html: text }} className="prose prose-slate dark:prose-invert max-w-none rich-content" />;
+      return <ReactMarkdown>{text}</ReactMarkdown>;
+    }
+  } catch {
+    // Plain text, markdown, or raw HTML
+    if (isHtml(content)) {
+      return <div dangerouslySetInnerHTML={{ __html: content }} className="prose prose-slate dark:prose-invert max-w-none rich-content" />;
+    }
+    return <ReactMarkdown>{content}</ReactMarkdown>;
+  }
+
+  return (
+    <div className="space-y-6">
+      {blocks.map((block: any, i: number) => {
+        switch (block.type) {
+          case 'text':
+            return (
+              <div key={i} className="prose prose-slate dark:prose-invert max-w-none">
+                {isHtml(block.text || '') ? (
+                  <div dangerouslySetInnerHTML={{ __html: block.text || '' }} className="rich-content" />
+                ) : (
+                  <ReactMarkdown>{block.text || ''}</ReactMarkdown>
+                )}
+              </div>
+            );
+
+          case 'image': {
+            const src = resolveUrl(block.imageUrl);
+            return (
+              <figure key={i} className="my-4">
+                {src ? (
+                  <img src={src} alt={block.imageCaption || 'Image'}
+                    className="w-full rounded-xl border border-slate-200 dark:border-slate-700 object-cover max-h-96"
+                    onError={e => { (e.target as HTMLImageElement).style.display = 'none'; }} />
+                ) : (
+                  <div className="flex items-center gap-3 p-4 bg-slate-100 dark:bg-slate-800 rounded-xl border border-dashed border-slate-300 dark:border-slate-600">
+                    <ImageIcon size={20} className="text-slate-400" />
+                    <span className="text-sm text-slate-500">{block.imageCaption || 'Image unavailable'}</span>
+                  </div>
+                )}
+                {block.imageCaption && src && (
+                  <figcaption className="text-xs text-slate-400 text-center mt-2">{block.imageCaption}</figcaption>
+                )}
+              </figure>
+            );
+          }
+
+          case 'video': {
+            const ytId = block.videoUrl ? getYouTubeId(block.videoUrl) : null;
+            const videoSrc = resolveUrl(block.videoUrl);
+            return (
+              <div key={i} className="my-4">
+                {ytId ? (
+                  <div className="aspect-video rounded-xl overflow-hidden border border-slate-200 dark:border-slate-700">
+                    <iframe src={`https://www.youtube.com/embed/${ytId}`} className="w-full h-full" allowFullScreen title={`video-${i}`} />
+                  </div>
+                ) : videoSrc ? (
+                  <video src={videoSrc} controls className="w-full rounded-xl border border-slate-200 dark:border-slate-700 max-h-96" />
+                ) : (
+                  <div className="flex items-center gap-3 p-4 bg-slate-100 dark:bg-slate-800 rounded-xl border border-dashed border-slate-300 dark:border-slate-600">
+                    <Video size={20} className="text-slate-400" />
+                    <span className="text-sm text-slate-500">Video unavailable</span>
+                  </div>
+                )}
+              </div>
+            );
+          }
+
+          case 'link':
+            return (
+              <div key={i} className="my-2">
+                <a
+                  href={block.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-2 px-4 py-2.5 bg-blue-50 dark:bg-blue-900/20 text-blue-600 dark:text-blue-400 rounded-xl border border-blue-200 dark:border-blue-800 font-semibold text-sm hover:bg-blue-100 dark:hover:bg-blue-900/30 transition-all"
+                >
+                  <Link2 size={16} />
+                  {block.label || block.url}
+                </a>
+              </div>
+            );
+
+          case 'file': {
+            const fileUrl = resolveUrl(block.fileUrl);
+            // Extract clean filename: strip uid prefix and URL noise
+            const rawName = block.fileLabel
+              || (block.fileUrl && !block.fileUrl.startsWith('http')
+                  ? block.fileUrl.replace(/\[UPLOADED:|]/g, '')
+                  : null)
+              || (fileUrl ? decodeURIComponent(new URL(fileUrl).searchParams.get('file') || '') : '')
+              || 'Document';
+            // Strip leading uid (hex_) prefix e.g. "69cec6dd3b42d_wireless..." → "wireless..."
+            const cleanName = rawName.replace(/^[a-f0-9]{8,}_/, '').replace(/_/g, ' ');
+            const ext = rawName.split('.').pop()?.toUpperCase() ?? '';
+            const extColors: Record<string, string> = {
+              PDF: 'bg-red-50 text-red-600 border-red-200 dark:bg-red-900/20 dark:text-red-400 dark:border-red-800',
+              DOCX: 'bg-blue-50 text-blue-600 border-blue-200 dark:bg-blue-900/20 dark:text-blue-400 dark:border-blue-800',
+              DOC: 'bg-blue-50 text-blue-600 border-blue-200 dark:bg-blue-900/20 dark:text-blue-400 dark:border-blue-800',
+              PPTX: 'bg-orange-50 text-orange-600 border-orange-200 dark:bg-orange-900/20 dark:text-orange-400 dark:border-orange-800',
+              PPT: 'bg-orange-50 text-orange-600 border-orange-200 dark:bg-orange-900/20 dark:text-orange-400 dark:border-orange-800',
+              XLSX: 'bg-green-50 text-green-600 border-green-200 dark:bg-green-900/20 dark:text-green-400 dark:border-green-800',
+              ZIP: 'bg-slate-50 text-slate-600 border-slate-200 dark:bg-slate-800 dark:text-slate-400 dark:border-slate-700',
+            };
+            const colorCls = extColors[ext] ?? 'bg-orange-50 text-orange-600 border-orange-200 dark:bg-orange-900/20 dark:text-orange-400 dark:border-orange-800';
+            return (
+              <div key={i} className="my-3">
+                {fileUrl ? (
+                  <a href={fileUrl} target="_blank" rel="noopener noreferrer" download
+                    className={`inline-flex items-center gap-3 px-5 py-3 rounded-xl border font-semibold text-sm transition-all hover:shadow-md hover:-translate-y-0.5 ${colorCls}`}>
+                    <div className="flex items-center justify-center w-8 h-8 rounded-lg bg-current/10 shrink-0">
+                      <FileText size={18} />
+                    </div>
+                    <div className="min-w-0">
+                      <div className="truncate max-w-xs font-bold">{cleanName}</div>
+                      <div className="text-xs opacity-60 font-normal">{ext} · Click to download</div>
+                    </div>
+                    <ArrowRight size={16} className="shrink-0 opacity-60" />
+                  </a>
+                ) : (
+                  <div className="flex items-center gap-3 p-4 bg-slate-100 dark:bg-slate-800 rounded-xl border border-dashed border-slate-300 dark:border-slate-600">
+                    <FileText size={20} className="text-slate-400" />
+                    <span className="text-sm text-slate-500">{cleanName}</span>
+                  </div>
+                )}
+              </div>
+            );
+          }
+
+          default:
+            return null;
+        }
+      })}
+    </div>
+  );
+};
+
+const CourseView: React.FC<CourseViewProps> = ({
+  initialCourseData, onBack, isEnrolled: initialEnrolled, userId = 'mock-user-id'
+}) => {
+  const contentRef = React.useRef<HTMLDivElement>(null);
+  const [course, setCourse] = useState<Course | null>(initialCourseData || null);
+  const [activeModuleIndex, setActiveModuleIndex] = useState(0);
+  const [activeLessonIndex, setActiveLessonIndex] = useState(0);
+  const [isEnrolled, setIsEnrolled] = useState(initialEnrolled || !!initialCourseData);
+  const [progress, setProgress] = useState(course?.progress || 0);
+  const [completedLessons, setCompletedLessons] = useState<string[]>(course?.completed_lessons || []);
+  const [isEnrolling, setIsEnrolling] = useState(false);
+
+  // Dynamic On-Demand Lesson Content Generation
+  const [lessonLoading, setLessonLoading] = useState(false);
+
+  useEffect(() => {
+    if (!course || activeModuleIndex === null || activeLessonIndex === null) return;
+    const activeModule = course.modules[activeModuleIndex];
+    const activeLesson = activeModule?.lessons[activeLessonIndex];
+    if (!activeLesson) return;
+
+    if (activeLesson.content === '[CONTENT_PENDING]' || !activeLesson.content) {
+      const fetchLessonContent = async () => {
+        setLessonLoading(true);
+        try {
+          const res = await fetch(`${API_BASE}/ai/lesson-content`, {
+            method: 'POST',
+            headers: { 
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${localStorage.getItem('auth_token')}`
+            },
+            body: JSON.stringify({
+              course_id: course.id,
+              lesson_title: activeLesson.title,
+              module_title: activeModule.title,
+              course_title: course.title
+            })
+          });
+          const data = await res.json();
+          if (data.content) {
+            setCourse(prev => {
+              if (!prev) return null;
+              const nextModules = prev.modules.map(mod => {
+                if (mod.title === activeModule.title) {
+                  return {
+                    ...mod,
+                    lessons: mod.lessons.map(les => {
+                      if (les.title === activeLesson.title) {
+                        return { ...les, content: data.content };
+                      }
+                      return les;
+                    })
+                  };
+                }
+                return mod;
+              });
+              return { ...prev, modules: nextModules };
+            });
+          }
+        } catch (err) {
+          console.error('Failed to load lesson content', err);
+        } finally {
+          setLessonLoading(false);
+        }
+      };
+      fetchLessonContent();
+    }
+  }, [activeModuleIndex, activeLessonIndex, course?.id]);
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [materials, setMaterials] = useState<any[]>([]);
+  const [showMaterials, setShowMaterials] = useState(false);
+  const [sidebarWidth, setSidebarWidth] = useState(320);
+  const [isResizing, setIsResizing] = useState(false);
+  const [expandedModules, setExpandedModules] = useState<Set<number>>(new Set([0]));
+  const [showAIModal, setShowAIModal] = useState(false);
+  const [showSuccessModal, setShowSuccessModal] = useState(false);
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [numQuestions, setNumQuestions] = useState(5);
+  const [courseFinished, setCourseFinished] = useState(false);
+
+  // Tab: 'lesson' | 'materials' | 'teacher-manage'
+  const [activeTab, setActiveTab] = useState<'lesson' | 'materials' | 'teacher-manage'>('lesson');
+
+  // Detect current user role for teacher management tab
+  const userRole = (() => {
+    try {
+      const saved = localStorage.getItem('user');
+      if (saved) return JSON.parse(saved)?.role || 'student';
+    } catch {}
+    return 'student';
+  })();
+
+  const toggleModule = (idx: number) => {
+    const next = new Set(expandedModules);
+    if (next.has(idx)) next.delete(idx);
+    else next.add(idx);
+    setExpandedModules(next);
+  };
+
+  useEffect(() => {
+    setExpandedModules(prev => {
+      if (prev.has(activeModuleIndex)) return prev;
+      return new Set(prev).add(activeModuleIndex);
+    });
+  }, [activeModuleIndex]);
+
+  const startResizing = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    setIsResizing(true);
+  }, []);
+
+  const stopResizing = useCallback(() => {
+    setIsResizing(false);
+  }, []);
+
+  const resize = useCallback((mouseMoveEvent: MouseEvent) => {
+    if (isResizing) {
+      const newWidth = mouseMoveEvent.clientX;
+      if (newWidth >= 200 && newWidth <= 550) {
+        setSidebarWidth(newWidth);
+      } else if (newWidth < 100) {
+        setSidebarOpen(false);
+        setIsResizing(false);
+      }
+    }
+  }, [isResizing]);
+
+  useEffect(() => {
+    if (isResizing) {
+      window.addEventListener("mousemove", resize);
+      window.addEventListener("mouseup", stopResizing);
+    } else {
+      window.removeEventListener("mousemove", resize);
+      window.removeEventListener("mouseup", stopResizing);
+    }
+    return () => {
+      window.removeEventListener("mousemove", resize);
+      window.removeEventListener("mouseup", stopResizing);
+    };
+  }, [isResizing, resize, stopResizing]);
+
+  // Scroll synchronization: Update activeLessonIndex based on what's visible
+  React.useEffect(() => {
+    if (activeTab !== 'lesson' || !contentRef.current) return;
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        entries.forEach((entry) => {
+          if (entry.isIntersecting) {
+            const id = entry.target.id;
+            const match = id.match(/lesson-(\d+)-(\d+)/);
+            if (match) {
+              const mIdx = parseInt(match[1]);
+              const lIdx = parseInt(match[2]);
+              if (activeModuleIndex === mIdx) {
+                setActiveLessonIndex(lIdx);
+              }
+            }
+          }
+        });
+      },
+      {
+        root: contentRef.current,
+        rootMargin: '-10% 0px -80% 0px', // Detect hits near the top of the viewport
+        threshold: 0,
+      }
+    );
+
+    const lessons = contentRef.current.querySelectorAll('article[id^="lesson-"]');
+    lessons.forEach((l) => observer.observe(l));
+
+    return () => observer.disconnect();
+  }, [activeTab, activeModuleIndex]);
+
+  if (!course) return null;
+
+  const activeModule = course.modules[activeModuleIndex];
+  const activeLesson = activeModule?.lessons[activeLessonIndex];
+
+  useEffect(() => {
+    if (course?.id) {
+      fetch(`${API_BASE}/resources/course/${course.id}`)
+        .then(r => r.json())
+        .then(d => setMaterials(Array.isArray(d) ? d : []))
+        .catch(() => setMaterials([]));
+    }
+  }, [course?.id]);
+
+  useEffect(() => {
+    if (isEnrolled && activeLesson && course) {
+      markLessonAsViewed(activeLesson.title);
+    }
+  }, [activeLesson?.title, isEnrolled, course, isEnrolled]);
+
+  const markLessonAsViewed = async (lessonTitle: string) => {
+    if (!course || completedLessons.includes(lessonTitle)) return;
+
+    const nextCompleted = [...completedLessons, lessonTitle];
+    setCompletedLessons(nextCompleted);
+
+    const totalLessons = course.modules.reduce((acc, m) => acc + m.lessons.length, 0);
+    const nextProgress = Math.round((nextCompleted.length / totalLessons) * 100);
+    setProgress(nextProgress);
+
+    try {
+      await fetch(`${API_BASE}/courses/${course.id}/progress`, {
+        method: 'PUT',
+        headers: { 
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${localStorage.getItem('auth_token')}`
+        },
+        body: JSON.stringify({ 
+          progress: nextProgress, 
+          completed_lessons: nextCompleted 
+        })
+      });
+    } catch (err) {
+      console.error('Failed to sync progress', err);
+    }
+  };
+
+  const handleEnroll = async () => {
+    if (!course?.id) return;
+    setIsEnrolling(true);
+    try {
+      await enrollInCourse(course.id, userId);
+      setIsEnrolled(true);
+    } catch (err) {
+      console.error('Failed to enroll', err);
+    } finally {
+      setIsEnrolling(false);
+    }
+  };
+
+  const handleCompleteLesson = () => {
+    goToNext();
+  };
+
+  const generateAssessment = async () => {
+    setIsGenerating(true);
+    try {
+      // 1. Prepare course context for AI
+      const courseContext = `
+        Course: ${course.title}
+        Description: ${course.description}
+        Structure:
+        ${course.modules.map((m, i) => `Module ${i+1}: ${m.title}\n${m.lessons.map(l => `- ${l.title}`).join('\n')}`).join('\n')}
+      `;
+
+      // 2. Request AI to generate assessment
+      const aiRes = await fetch(`${API_BASE}/ai/generate-assessment`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          course_title: course.title,
+          course_content: courseContext,
+          question_count: numQuestions
+        })
+      });
+      const assessmentData = await aiRes.json();
+      if (assessmentData.error) throw new Error(assessmentData.error);
+
+      // 3. Save assessment to database
+      const saveRes = await fetch(`${API_BASE}/assessments`, {
+        method: 'POST',
+        headers: { 
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${localStorage.getItem('auth_token')}`
+        },
+        body: JSON.stringify({
+          course_id: course.id,
+          title: assessmentData.title,
+          description: assessmentData.description,
+          questions: assessmentData.questions
+        })
+      });
+      const saveResult = await saveRes.json();
+      if (saveResult.error) throw new Error(saveResult.error);
+
+      setShowAIModal(false);
+      setShowSuccessModal(true);
+    } catch (err: any) {
+      console.error(err);
+      alert('Generation failed: ' + err.message);
+    } finally {
+      setIsGenerating(false);
+    }
+  };
+
+  const goToPrev = () => {
+    if (activeLessonIndex > 0) setActiveLessonIndex(i => i - 1);
+    else if (activeModuleIndex > 0) {
+      setActiveModuleIndex(i => i - 1);
+      setActiveLessonIndex(course.modules[activeModuleIndex - 1].lessons.length - 1);
+    }
+  };
+
+  const goToNext = () => {
+    if (activeLessonIndex < activeModule.lessons.length - 1) {
+      setActiveLessonIndex(i => i + 1);
+    } else if (activeModuleIndex < course.modules.length - 1) {
+      setActiveModuleIndex(i => i + 1);
+      setActiveLessonIndex(0);
+    }
+  };
+
+  const isFirst = activeModuleIndex === 0 && activeLessonIndex === 0;
+  const isLast = activeModuleIndex === course.modules.length - 1 &&
+    activeLessonIndex === activeModule.lessons.length - 1;
+
+  return (
+    <div className="min-h-screen bg-slate-50 dark:bg-slate-950 flex flex-col md:flex-row animate-in fade-in duration-500">
+
+      {/* Sidebar */}
+      {sidebarOpen && (
+        <aside 
+          style={{ width: `${sidebarWidth}px` }}
+          className="bg-white dark:bg-slate-900 border-r border-slate-200 dark:border-slate-800 h-screen overflow-y-auto flex flex-col shrink-0 relative group">
+          {/* Resize Handle */}
+          <div
+            onMouseDown={startResizing}
+            className={`absolute top-0 -right-1 w-2 h-full cursor-col-resize z-50 transition-colors ${isResizing ? 'bg-indigo-500' : 'group-hover:bg-indigo-500/20'}`}
+          />
+          {/* Sidebar Header */}
+          <div className="p-5 border-b border-slate-100 dark:border-slate-800">
+            <div className="flex items-center justify-between mb-3">
+              <button
+                onClick={onBack}
+                title="Back to courses"
+                className="p-1.5 rounded-lg text-slate-400 hover:text-indigo-600 hover:bg-slate-100 dark:hover:bg-slate-800 transition-all"
+              >
+                <ArrowLeft size={18} />
+              </button>
+              <button
+                onClick={() => setSidebarOpen(false)}
+                title="Collapse sidebar"
+                className="p-1.5 rounded-lg text-slate-400 hover:text-indigo-600 hover:bg-slate-100 dark:hover:bg-slate-800 transition-all"
+              >
+                <ChevronsLeft size={18} />
+              </button>
+            </div>
+            <h2 className="font-bold text-base text-slate-800 dark:text-white leading-tight mb-2">
+              {course.title}
+            </h2>
+            <div className="flex items-center gap-2 mb-3">
+              <span className="bg-emerald-100 text-emerald-700 px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider">
+                {course.level}
+              </span>
+            </div>
+            {isEnrolled ? (
+              <div className="space-y-3">
+                <div className="space-y-1">
+                  <div className="flex justify-between text-xs font-bold text-slate-500">
+                    <span>Progress</span><span>{progress}%</span>
+                  </div>
+                  <div className="h-1.5 bg-slate-100 rounded-full overflow-hidden">
+                    <div className="h-full bg-emerald-500 transition-all duration-500" style={{ width: `${progress}%` }} />
+                  </div>
+                </div>
+                <button
+                  onClick={() => setShowAIModal(true)}
+                  className="w-full flex items-center justify-center gap-2 bg-indigo-50 dark:bg-indigo-900/20 text-indigo-600 dark:text-indigo-400 py-2.5 rounded-xl font-bold text-xs hover:bg-indigo-100 dark:hover:bg-indigo-900/30 transition-all border border-indigo-100 dark:border-indigo-800"
+                >
+                  <Brain size={14} /> AI Assessment
+                </button>
+              </div>
+            ) : (
+              <button
+                disabled={isEnrolling}
+                onClick={handleEnroll}
+                className="w-full bg-slate-900 text-white py-2.5 rounded-xl font-bold text-sm hover:bg-slate-800 transition-all disabled:opacity-50"
+              >
+                {isEnrolling ? 'Enrolling...' : 'Enroll Now'}
+              </button>
+            )}
+          </div>
+
+          <div className="shrink-0">
+            {course.modules.map((module, mIdx) => {
+              const isExpanded = expandedModules.has(mIdx);
+              return (
+                <div key={mIdx} className="border-b border-slate-50 dark:border-slate-800/50">
+                  <button
+                    onClick={() => toggleModule(mIdx)}
+                    className="w-full px-5 py-4 bg-slate-50/50 dark:bg-slate-900/50 flex items-center justify-between group transition-colors hover:bg-slate-100 dark:hover:bg-slate-800/80 z-10"
+                  >
+                    <div className="flex items-center gap-3">
+                      <div className="w-8 h-8 rounded-lg bg-indigo-50 dark:bg-indigo-900/30 flex items-center justify-center shrink-0">
+                        <span className="text-xs font-bold text-indigo-600 dark:text-indigo-400">{mIdx + 1}</span>
+                      </div>
+                      <span className="font-bold text-sm text-slate-700 dark:text-slate-300 text-left leading-tight">
+                        {module.title}
+                      </span>
+                    </div>
+                    {isExpanded ? <ChevronDown size={16} className="text-slate-400 group-hover:text-indigo-500 transition-colors" /> : <ChevronRight size={16} className="text-slate-400 group-hover:text-indigo-500 transition-colors" />}
+                  </button>
+                  
+                  {isExpanded && (
+                    <div className="space-y-0.5 py-1 animate-in slide-in-from-top-2 duration-300">
+                      {module.lessons.map((lesson, lIdx) => {
+                        const isActive = activeModuleIndex === mIdx && activeLessonIndex === lIdx;
+                        const isLocked = !isEnrolled && mIdx > 0;
+                        return (
+                          <button
+                            key={lIdx}
+                            onClick={() => { 
+                              if (!isLocked) { 
+                                if (activeModuleIndex !== mIdx) {
+                                  setActiveModuleIndex(mIdx);
+                                  setTimeout(() => {
+                                    document.getElementById(`lesson-${mIdx}-${lIdx}`)?.scrollIntoView({ behavior: 'smooth' });
+                                  }, 100);
+                                } else {
+                                  document.getElementById(`lesson-${mIdx}-${lIdx}`)?.scrollIntoView({ behavior: 'smooth' });
+                                }
+                                setActiveLessonIndex(lIdx); 
+                              } 
+                            }}
+                            disabled={isLocked}
+                            className={`w-full text-left px-5 py-3 flex items-start gap-3 transition-colors ${activeModuleIndex === mIdx && activeLessonIndex === lIdx ? 'bg-indigo-50 dark:bg-indigo-500/10 border-r-2 border-indigo-500' : 'hover:bg-slate-50 dark:hover:bg-slate-800'} ${isLocked ? 'opacity-50 cursor-not-allowed' : ''}`}
+                          >
+                            {isActive ? (
+                              <PlayCircle size={15} className="text-indigo-500 mt-0.5 shrink-0" />
+                            ) : completedLessons.includes(lesson.title) ? (
+                              <CheckCircle size={15} className="text-emerald-500 mt-0.5 shrink-0" />
+                            ) : isLocked ? (
+                              <Lock size={15} className="text-slate-300 mt-0.5 shrink-0" />
+                            ) : (
+                              <div className="w-3.5 h-3.5 rounded-full border-2 border-slate-300 mt-0.5 shrink-0" />
+                            )}
+                            <div>
+                              <p className={`text-xs font-medium ${isActive ? 'text-indigo-700 dark:text-indigo-300' : 'text-slate-600 dark:text-slate-400'}`}>
+                                {lesson.title}
+                              </p>
+                              <p className="text-[10px] text-slate-400 mt-0.5 flex items-center gap-1">
+                                <Clock size={9} /> {lesson.duration}
+                              </p>
+                            </div>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </aside>
+      )}
+
+      {/* Main Content */}
+      <main className="flex-1 flex flex-col h-screen overflow-hidden relative">
+        {/* Top Bar */}
+        <header className="h-14 border-b border-slate-100 dark:border-slate-800 bg-white dark:bg-slate-900 flex items-center justify-between px-6 shrink-0">
+          <div className="flex items-center gap-3">
+            {/* Expand button shown when sidebar is collapsed */}
+            {!sidebarOpen && (
+              <button
+                onClick={() => setSidebarOpen(true)}
+                title="Expand sidebar"
+                className="p-1.5 rounded-lg text-slate-400 hover:text-indigo-600 hover:bg-slate-100 dark:hover:bg-slate-800 transition-all"
+              >
+                <Menu size={18} />
+              </button>
+            )}
+            <div className="flex items-center gap-2 text-slate-400 text-sm font-medium">
+              <BookOpen size={15} />
+              <span className="hidden sm:inline">{activeModule?.title}</span>
+              <span className="text-slate-300 hidden sm:inline">/</span>
+              <span className="text-slate-800 dark:text-white font-bold truncate max-w-xs">{activeLesson?.title}</span>
+            </div>
+          </div>
+          {!isEnrolled && (
+            <span className="bg-amber-100 text-amber-700 px-3 py-1 rounded-full text-xs font-bold flex items-center gap-1">
+              <Lock size={11} /> Preview
+            </span>
+          )}
+          {materials.length > 0 && (
+            <button onClick={() => setShowMaterials(v => !v)}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition-all ${showMaterials ? 'bg-indigo-600 text-white' : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 hover:bg-indigo-50 hover:text-indigo-600'}`}>
+              <FileText size={14} /> Materials ({materials.length})
+            </button>
+          )}
+        </header>
+
+        {/* Teacher Materials Panel */}
+        {showMaterials && materials.length > 0 && (
+          <div className="border-b border-slate-200 dark:border-slate-800 bg-indigo-50 dark:bg-indigo-900/10 px-6 py-4">
+            <h3 className="text-sm font-bold text-indigo-700 dark:text-indigo-300 mb-3 flex items-center gap-2">
+              <FileText size={15} /> Teacher Materials
+            </h3>
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+              {materials.map((m: any) => (
+                <a key={m.id}
+                  href={m.file_url || m.external_url || '#'}
+                  target="_blank" rel="noopener noreferrer"
+                  className="flex items-center gap-3 p-3 bg-white dark:bg-slate-900 rounded-xl border border-indigo-200 dark:border-indigo-800 hover:shadow-md transition-all group">
+                  <div className="w-9 h-9 bg-indigo-100 dark:bg-indigo-900/30 rounded-lg flex items-center justify-center shrink-0">
+                    {m.resource_type === 'video' ? <Video size={16} className="text-indigo-600" /> :
+                     m.resource_type === 'link' ? <ExternalLink size={16} className="text-indigo-600" /> :
+                     <FileText size={16} className="text-indigo-600" />}
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-semibold text-primary dark:text-white truncate group-hover:text-indigo-600 transition-colors">{m.title}</p>
+                    <p className="text-xs text-slate-400 capitalize">{m.resource_type} · {m.uploader_name}</p>
+                  </div>
+                  <Download size={14} className="text-slate-300 group-hover:text-indigo-500 shrink-0 transition-colors" />
+                </a>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* ── Tab Bar ── */}
+        <div className="flex border-b border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-6 shrink-0">
+          <button
+            onClick={() => setActiveTab('lesson')}
+            className={`flex items-center gap-2 px-4 py-3 text-sm font-bold border-b-2 transition-all ${
+              activeTab === 'lesson'
+                ? 'border-careermap-teal text-careermap-teal'
+                : 'border-transparent text-slate-400 hover:text-slate-600'
+            }`}
+          >
+            <BookOpen size={15} /> Lesson
+          </button>
+          {course?.author !== 'AI Architect' && (
+            <button
+              onClick={() => setActiveTab('materials')}
+              className={`flex items-center gap-2 px-4 py-3 text-sm font-bold border-b-2 transition-all ${
+                activeTab === 'materials'
+                  ? 'border-careermap-teal text-careermap-teal'
+                  : 'border-transparent text-slate-400 hover:text-slate-600'
+              }`}
+            >
+              <User size={15} /> Teacher Materials
+            </button>
+          )}
+          {(userRole === 'teacher' || userRole === 'admin') && course?.author !== 'AI Architect' && (
+            <button
+              onClick={() => setActiveTab('teacher-manage')}
+              className={`flex items-center gap-2 px-4 py-3 text-sm font-bold border-b-2 transition-all ${
+                activeTab === 'teacher-manage'
+                  ? 'border-careermap-teal text-careermap-teal'
+                  : 'border-transparent text-slate-400 hover:text-slate-600'
+              }`}
+            >
+              <GraduationCap size={15} /> Manage Materials
+            </button>
+          )}
+        </div>
+
+        {/* ── Tab Content ── */}
+        {activeTab === 'lesson' && (
+          <div 
+            ref={contentRef}
+            className="flex-1 overflow-y-auto p-8 md:p-12 max-w-4xl mx-auto w-full scroll-smooth"
+          >
+            {/* Module header in main content */}
+            <div className="mb-10 pb-6 border-b border-slate-100 dark:border-slate-800">
+              <span className="text-careermap-teal font-black text-xs uppercase tracking-[0.3em] mb-3 block">Module {activeModuleIndex + 1}</span>
+              <h2 className="text-4xl font-serif font-black text-slate-800 dark:text-white leading-tight">
+                {activeModule?.title}
+              </h2>
+            </div>
+
+            <div className="space-y-16">
+              {activeModule?.lessons.map((lesson, lIdx) => (
+                <article key={lIdx} id={`lesson-${activeModuleIndex}-${lIdx}`} className="animate-in fade-in slide-in-from-bottom-8 duration-700">
+                  <div className="prose prose-slate dark:prose-invert max-w-none">
+                    <header className="mb-10">
+                      <div className="flex items-center gap-4 mb-4">
+                        <span className="w-10 h-10 rounded-full bg-slate-100 dark:bg-slate-800 flex items-center justify-center text-xs font-black text-slate-400">
+                          {lIdx + 1}
+                        </span>
+                        <div className="h-px flex-1 bg-slate-100 dark:bg-slate-800" />
+                      </div>
+                      <h1 className="text-3xl md:text-4xl font-bold text-slate-900 dark:text-white mb-2 leading-tight">
+                        {lesson.title}
+                      </h1>
+                      <div className="flex items-center gap-3 text-slate-400 text-sm font-medium">
+                        <Clock size={14} /> {lesson.duration}
+                        {completedLessons.includes(lesson.title) && (
+                          <span className="flex items-center gap-1 text-emerald-500 text-xs font-bold uppercase tracking-wider ml-2">
+                            <CheckCircle size={14} /> Completed
+                          </span>
+                        )}
+                      </div>
+                    </header>
+                    
+                    <div className="min-h-[200px]">
+                      {lessonLoading || lesson.content === '[CONTENT_PENDING]' ? (
+                        <div className="flex flex-col items-center justify-center py-16 px-6 rounded-3xl bg-slate-50/50 dark:bg-slate-900/30 border border-dashed border-slate-200 dark:border-slate-800 animate-pulse text-center">
+                          <div className="w-16 h-16 rounded-2xl bg-indigo-50 dark:bg-indigo-900/30 flex items-center justify-center text-indigo-600 mb-4 shadow-inner">
+                            <Brain className="animate-spin text-indigo-500" size={32} style={{ animationDuration: '3s' }} />
+                          </div>
+                          <h3 className="text-lg font-bold text-slate-800 dark:text-white mb-2">AI is architecting your lesson...</h3>
+                          <p className="text-sm text-slate-400 max-w-sm">
+                            We are compiling high-fidelity concepts, practice exercises, and study guides specifically for <strong className="text-slate-700 dark:text-slate-200">"{lesson.title}"</strong>.
+                          </p>
+                        </div>
+                      ) : (
+                        <BlockRenderer content={lesson.content || ''} />
+                      )}
+                    </div>
+                  </div>
+
+                  {lIdx < activeModule.lessons.length - 1 && (
+                    <div className="mt-16 pt-8 flex flex-col items-center gap-4">
+                      <div className="w-px h-10 bg-gradient-to-b from-slate-200 to-transparent dark:from-slate-700" />
+                      <span className="text-[10px] font-black uppercase tracking-[0.4em] text-slate-300 dark:text-slate-600">Next Lesson</span>
+                    </div>
+                  )}
+                </article>
+              ))}
+            </div>
+
+            {/* Navigation to Next Module */}
+            <div className="mt-32 flex justify-between pt-12 border-t-2 border-slate-100 dark:border-slate-800">
+              <button
+                disabled={activeModuleIndex === 0}
+                onClick={() => { setActiveModuleIndex(prev => prev - 1); setActiveLessonIndex(0); }}
+                className="flex flex-col items-start gap-2 group"
+              >
+                <span className="text-[10px] font-black uppercase tracking-widest text-slate-400 group-hover:text-careermap-teal transition-colors">Previous Module</span>
+                <div className="flex items-center gap-3 px-6 py-3 rounded-2xl border border-slate-200 dark:border-slate-800 hover:border-careermap-teal bg-white dark:bg-slate-900 font-bold text-sm text-slate-700 dark:text-slate-300 transition-all shadow-sm group-hover:shadow-md">
+                  <ArrowLeft size={18} className="group-hover:-translate-x-1 transition-transform" /> 
+                  {course.modules[activeModuleIndex - 1]?.title || 'Back to Start'}
+                </div>
+              </button>
+
+              <button
+                disabled={activeModuleIndex === course.modules.length - 1 && courseFinished}
+                onClick={() => {
+                  if (activeModuleIndex < course.modules.length - 1) {
+                    setActiveModuleIndex(prev => prev + 1);
+                    setActiveLessonIndex(0);
+                  } else {
+                    setCourseFinished(true);
+                  }
+                }}
+                className="flex flex-col items-end gap-2 group text-right"
+              >
+                <span className="text-[10px] font-black uppercase tracking-widest text-slate-400 group-hover:text-careermap-teal transition-colors">
+                  {activeModuleIndex === course.modules.length - 1 ? (courseFinished ? 'Completed' : 'Finish') : 'Next Module'}
+                </span>
+                <div className={`flex items-center gap-3 px-6 py-3 rounded-2xl font-bold text-sm transition-all shadow-lg ${
+                  courseFinished && activeModuleIndex === course.modules.length - 1
+                    ? 'bg-emerald-600 text-white shadow-emerald-500/20 cursor-default'
+                    : 'bg-slate-900 text-white hover:bg-black group-hover:shadow-indigo-500/20'
+                }`}>
+                  {activeModuleIndex === course.modules.length - 1
+                    ? courseFinished
+                      ? <><CheckCircle size={18} /> Finished</>
+                      : <>Finish Course <ArrowRight size={18} className="group-hover:translate-x-1 transition-transform" /></>
+                    : <>{course.modules[activeModuleIndex + 1]?.title} <ArrowRight size={18} className="group-hover:translate-x-1 transition-transform" /></>
+                  }
+                </div>
+              </button>
+            </div>
+          </div>
+        )}
+
+        {activeTab === 'materials' && (
+          <div className="flex-1 overflow-y-auto p-8 max-w-4xl mx-auto w-full">
+            <StudentMaterialsTab courseId={String(course.id)} />
+          </div>
+        )}
+
+        {activeTab === 'teacher-manage' && (userRole === 'teacher' || userRole === 'admin') && course?.author !== 'AI Architect' && (
+          <div className="flex-1 overflow-y-auto p-8 max-w-4xl mx-auto w-full">
+            <TeacherMaterialsTab
+              courseId={String(course.id)}
+              modules={course.modules.map(m => ({
+                title: m.title,
+                lessons: m.lessons.map(l => ({ title: l.title })),
+              }))}
+            />
+          </div>
+        )}
+      </main>
+
+      {/* AI Assessment Modal */}
+      {showAIModal && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm animate-in fade-in duration-300">
+          <div className="bg-white dark:bg-slate-900 rounded-[2rem] w-full max-w-md overflow-hidden shadow-2xl border border-slate-200 dark:border-slate-800 animate-in zoom-in-95 duration-300">
+            <div className="p-8">
+              <div className="flex justify-between items-start mb-6">
+                <div className="w-12 h-12 rounded-2xl bg-indigo-100 dark:bg-indigo-900/30 flex items-center justify-center text-indigo-600">
+                  <Brain size={24} />
+                </div>
+                <button onClick={() => setShowAIModal(false)} className="p-2 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 transition-colors">
+                  <X size={20} />
+                </button>
+              </div>
+              
+              <h3 className="text-2xl font-bold text-slate-800 dark:text-white mb-2">Generate Assessment</h3>
+              <p className="text-slate-500 dark:text-slate-400 text-sm mb-6">
+                Our AI will analyze the course content and generate a custom quiz to test your knowledge.
+              </p>
+
+              <div className="space-y-4 mb-8">
+                <label className="block">
+                  <span className="text-xs font-bold text-slate-400 uppercase tracking-widest block mb-2">Number of Questions</span>
+                  <div className="flex items-center gap-4">
+                    <input 
+                      type="range" min="3" max="15" step="1"
+                      value={numQuestions}
+                      onChange={(e) => setNumQuestions(parseInt(e.target.value))}
+                      className="flex-1 accent-indigo-600"
+                    />
+                    <span className="w-8 text-center font-bold text-slate-700 dark:text-white">{numQuestions}</span>
+                  </div>
+                </label>
+              </div>
+
+              <button
+                disabled={isGenerating}
+                onClick={generateAssessment}
+                className="w-full bg-indigo-600 text-white py-4 rounded-2xl font-bold flex items-center justify-center gap-2 hover:bg-indigo-700 hover:shadow-lg hover:shadow-indigo-500/20 active:scale-[0.98] transition-all disabled:opacity-50"
+              >
+                {isGenerating ? (
+                  <><Loader2 size={18} className="animate-spin" /> Analyzing Content...</>
+                ) : (
+                  <><HelpCircle size={18} /> Generate Quiz Now</>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* AI Assessment Success Modal */}
+      {showSuccessModal && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm animate-in fade-in duration-300">
+          <div className="bg-white dark:bg-slate-900 rounded-[2rem] w-full max-w-md overflow-hidden shadow-2xl border border-slate-200 dark:border-slate-800 animate-in zoom-in-95 duration-300">
+            <div className="p-8 text-center">
+              <div className="flex justify-end">
+                <button onClick={() => setShowSuccessModal(false)} className="p-2 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 transition-colors">
+                  <X size={20} />
+                </button>
+              </div>
+              <div className="mx-auto w-16 h-16 rounded-full bg-emerald-100 dark:bg-emerald-900/30 flex items-center justify-center text-emerald-600 mb-6 animate-bounce">
+                <CheckCircle size={32} />
+              </div>
+              <h3 className="text-2xl font-bold text-slate-800 dark:text-white mb-3">Assessment Ready!</h3>
+              <p className="text-slate-500 dark:text-slate-400 text-sm mb-8 leading-relaxed">
+                Your AI Assessment has been generated successfully! You can find it in your Assessments center.
+              </p>
+              <button
+                onClick={() => setShowSuccessModal(false)}
+                className="w-full bg-emerald-600 hover:bg-emerald-700 text-white py-4 rounded-2xl font-bold hover:shadow-lg hover:shadow-emerald-500/20 active:scale-[0.98] transition-all"
+              >
+                Awesome!
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default CourseView;
